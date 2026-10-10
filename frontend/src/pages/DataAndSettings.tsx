@@ -193,7 +193,6 @@ export const DataAndSettings: React.FC = () => {
               >
                 <option value="returns">Returns</option>
                 <option value="products">Products</option>
-                <option value="suppliers">Suppliers</option>
                 <option value="inventory">Inventory</option>
                 <option value="vendor_terms">Vendor Terms</option>
                 <option value="refurbishment">Refurbishment Rules</option>
