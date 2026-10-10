@@ -1,4 +1,3 @@
-```python
 import io
 import csv
 from datetime import datetime
@@ -249,22 +248,24 @@ async def import_csv_dataset(
 
     # RETURNS
     elif entity_type == "returns":
-        organizer_format = {
-            "return_id", "date_received", "sku",
-            "supplier_batch", "reason_code",
-            "condition_grade", "status"
-        }.issubset(headers)
-
-        required = (
-            {"return_id", "date_received", "sku", "supplier_batch",
-             "reason_code", "condition_grade", "status"}
-            if organizer_format else
-            {"return_date", "sku", "supplier_batch",
-             "reason_code", "grade", "quantity"}
+        # Accept both the application's template and the organizer's dataset.
+        organizer_format = (
+            ("date_received" in headers or "return_date" not in headers)
+            and ("condition_grade" in headers or "grade" not in headers)
+            and "sku" in headers
+            and "supplier_batch" in headers
+            and "reason_code" in headers
         )
 
-        missing = required - headers
+        required = (
+            {"date_received" if "date_received" in headers else "return_date",
+             "sku", "supplier_batch", "reason_code",
+             "condition_grade" if "condition_grade" in headers else "grade"}
+        )
+        if not organizer_format:
+            required.add("quantity")
 
+        missing = required - headers
         if missing:
             raise HTTPException(
                 status_code=400,
@@ -284,8 +285,7 @@ async def import_csv_dataset(
         for idx, row in enumerate(rows, 2):
             try:
                 with db.begin_nested():
-                    sku = row["sku"]
-
+                    sku = row.get("sku", "").strip()
                     product = db.query(Product).filter(
                         Product.sku == sku
                     ).first()
@@ -296,64 +296,51 @@ async def import_csv_dataset(
                             "Import products first."
                         )
 
-                    r_date = parse_date(
-                        row.get("date_received") or row.get("return_date")
-                    )
+                    date_value = row.get("date_received") or row.get("return_date")
+                    r_date = parse_date(date_value)
 
-                    grade = (
-                        row.get("condition_grade") or row.get("grade")
-                    ).upper()
-
+                    grade_value = row.get("condition_grade") or row.get("grade") or ""
+                    grade = grade_value.strip().upper()
                     if grade not in {"A", "B", "C", "D"}:
                         raise ValueError(f"Invalid grade '{grade}'.")
 
-                    quantity = (
-                        1 if organizer_format
-                        else int(row["quantity"])
-                    )
-
+                    # Organizer data has one return record per row and no quantity
+                    # column, so treat each row as one unit.
+                    quantity_value = row.get("quantity")
+                    quantity = 1 if not quantity_value and organizer_format else int(quantity_value or 0)
                     if quantity <= 0:
                         raise ValueError("Quantity must be positive.")
 
-                    raw_status = row.get("status") or "Pending Decision"
+                    raw_status = (row.get("status") or "Pending Decision").strip()
                     status = status_mapping.get(raw_status.lower())
-
                     if not status:
-                        raise ValueError(
-                            f"Unsupported return status '{raw_status}'."
-                        )
-
-                    return_id = (
-                        int(row["return_id"])
-                        if organizer_format else None
-                    )
-
-                    ret = None
-
-                    if return_id is not None:
-                        ret = db.query(Return).filter(
-                            Return.id == return_id
-                        ).first()
+                        raise ValueError(f"Unsupported return status '{raw_status}'.")
 
                     values = {
                         "return_date": r_date,
                         "sku": sku,
-                        "supplier_batch": row["supplier_batch"],
-                        "reason_code": row["reason_code"],
+                        "supplier_batch": row.get("supplier_batch", "").strip(),
+                        "reason_code": row.get("reason_code", "").strip(),
                         "grade": grade,
                         "quantity": quantity,
                         "status": status
                     }
+
+                    # The organizer's return_id values (e.g. R50813) are external
+                    # string identifiers, not this database's integer primary key.
+                    # Let the database generate its own Return.id.
+                    ret = None
+                    external_id = row.get("return_id", "").strip()
+                    if external_id.isdigit():
+                        ret = db.query(Return).filter(
+                            Return.id == int(external_id)
+                        ).first()
 
                     if ret:
                         for key, value in values.items():
                             setattr(ret, key, value)
                     else:
                         values["received_at"] = datetime.utcnow()
-
-                        if return_id is not None:
-                            values["id"] = return_id
-
                         db.add(Return(**values))
 
                 successful += 1
@@ -688,4 +675,3 @@ async def import_csv_dataset(
         failed_rows=failed,
         errors=errors[:10]
     )
-```
