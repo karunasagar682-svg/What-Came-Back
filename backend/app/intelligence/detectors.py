@@ -10,6 +10,23 @@ from app.engine.calculator import calculate_route_options
 from app.schemas.schemas import PriorityItem, BatchIntelligenceResponse
 
 
+
+def _cached_first(db: Session, cache_key: tuple, query):
+    """Cache repeated lookup results for the lifetime of this request's DB session."""
+    cache = db.info.setdefault("_detector_lookup_cache", {})
+    if cache_key not in cache:
+        cache[cache_key] = query.first()
+    return cache[cache_key]
+
+
+def _cached_all(db: Session, cache_key: tuple, query):
+    """Cache repeated list queries for the lifetime of this request's DB session."""
+    cache = db.info.setdefault("_detector_lookup_cache", {})
+    if cache_key not in cache:
+        cache[cache_key] = query.all()
+    return cache[cache_key]
+
+
 def _return_age_days(return_date, current_date: date) -> int:
     """Calculate non-negative age; future-dated records are not treated as old."""
     normalized_date = (
@@ -21,24 +38,24 @@ def _return_age_days(return_date, current_date: date) -> int:
 
 def _get_vendor_term(db: Session, supplier_id: int, sku: str):
     """Prefer SKU-specific vendor terms, then use supplier-wide terms."""
-    sku_term = (
-        db.query(VendorTerm)
-        .filter(
+    sku_term = _cached_first(
+        db,
+        ("vendor_term_sku", supplier_id, sku),
+        db.query(VendorTerm).filter(
             VendorTerm.supplier_id == supplier_id,
             VendorTerm.sku == sku,
-        )
-        .first()
+        ),
     )
     if sku_term:
         return sku_term
 
-    return (
-        db.query(VendorTerm)
-        .filter(
+    return _cached_first(
+        db,
+        ("vendor_term_supplier", supplier_id),
+        db.query(VendorTerm).filter(
             VendorTerm.supplier_id == supplier_id,
             VendorTerm.sku.is_(None),
-        )
-        .first()
+        ),
     )
 
 
@@ -86,15 +103,10 @@ def detect_high_value_waiting_too_long(
             continue
 
         age = _return_age_days(ret.return_date, current_date)
-        inv = db.query(Inventory).filter(Inventory.sku == prod.sku).first()
-        refurb = db.query(RefurbishmentRule).filter(
-            RefurbishmentRule.category == prod.category
-        ).first()
+        inv = _cached_first(db, ("inventory", prod.sku), db.query(Inventory).filter(Inventory.sku == prod.sku))
+        refurb = _cached_first(db, ("refurb", prod.category), db.query(RefurbishmentRule).filter(RefurbishmentRule.category == prod.category))
         vt = _get_vendor_term(db, supp.id, prod.sku)
-        liq = db.query(LiquidationRule).filter(
-            LiquidationRule.category == prod.category,
-            LiquidationRule.grade == ret.grade
-        ).first()
+        liq = _cached_first(db, ("liquidation", prod.category, ret.grade), db.query(LiquidationRule).filter(LiquidationRule.category == prod.category, LiquidationRule.grade == ret.grade))
 
         analysis = calculate_route_options(
             prod, ret, inv, refurb, vt, liq, current_date
@@ -165,19 +177,14 @@ def detect_avoidable_liquidation_losses(
     results: List[PriorityItem] = []
 
     for ret in _pending_returns(db):
-        prod = db.query(Product).filter(Product.sku == ret.sku).first()
+        prod = _cached_first(db, ("product", ret.sku), db.query(Product).filter(Product.sku == ret.sku))
         if not prod:
             continue
 
-        inv = db.query(Inventory).filter(Inventory.sku == prod.sku).first()
-        refurb = db.query(RefurbishmentRule).filter(
-            RefurbishmentRule.category == prod.category
-        ).first()
+        inv = _cached_first(db, ("inventory", prod.sku), db.query(Inventory).filter(Inventory.sku == prod.sku))
+        refurb = _cached_first(db, ("refurb", prod.category), db.query(RefurbishmentRule).filter(RefurbishmentRule.category == prod.category))
         vt = _get_vendor_term(db, prod.supplier_id, prod.sku)
-        liq = db.query(LiquidationRule).filter(
-            LiquidationRule.category == prod.category,
-            LiquidationRule.grade == ret.grade
-        ).first()
+        liq = _cached_first(db, ("liquidation", prod.category, ret.grade), db.query(LiquidationRule).filter(LiquidationRule.category == prod.category, LiquidationRule.grade == ret.grade))
 
         analysis = calculate_route_options(
             prod, ret, inv, refurb, vt, liq, current_date
@@ -236,7 +243,7 @@ def detect_expiring_vendor_windows(
     results: List[PriorityItem] = []
 
     for ret in _pending_returns(db):
-        prod = db.query(Product).filter(Product.sku == ret.sku).first()
+        prod = _cached_first(db, ("product", ret.sku), db.query(Product).filter(Product.sku == ret.sku))
         if not prod:
             continue
 
@@ -249,9 +256,7 @@ def detect_expiring_vendor_windows(
         eligible_qty = ret.quantity if days_remaining >= 0 else 0
 
         if 0 <= days_remaining <= warning_days_threshold and eligible_qty > 0:
-            supp = db.query(Supplier).filter(
-                Supplier.id == prod.supplier_id
-            ).first()
+            supp = _cached_first(db, ("supplier", prod.supplier_id), db.query(Supplier).filter(Supplier.id == prod.supplier_id))
             supp_name = supp.supplier_name if supp else "Supplier"
 
             unit_credit = round(
@@ -306,9 +311,7 @@ def detect_supplier_and_batch_anomalies(
         if not batch_code:
             continue
 
-        returns_in_batch = db.query(Return).filter(
-            Return.supplier_batch == batch_code
-        ).all()
+        returns_in_batch = _cached_all(db, ("batch_returns", batch_code), db.query(Return).filter(Return.supplier_batch == batch_code))
         if not returns_in_batch:
             continue
 
@@ -317,13 +320,11 @@ def detect_supplier_and_batch_anomalies(
             continue
 
         sample_ret = returns_in_batch[0]
-        prod = db.query(Product).filter(Product.sku == sample_ret.sku).first()
+        prod = _cached_first(db, ("product", sample_ret.sku), db.query(Product).filter(Product.sku == sample_ret.sku))
         if not prod:
             continue
 
-        supp = db.query(Supplier).filter(
-            Supplier.id == prod.supplier_id
-        ).first()
+        supp = _cached_first(db, ("supplier", prod.supplier_id), db.query(Supplier).filter(Supplier.id == prod.supplier_id))
         supplier_name = supp.supplier_name if supp else "Supplier"
 
         reason_counts: Dict[str, int] = {}
@@ -384,19 +385,17 @@ def detect_refurb_demand_mismatch(
     results: List[PriorityItem] = []
 
     for ret in _pending_returns(db):
-        prod = db.query(Product).filter(Product.sku == ret.sku).first()
+        prod = _cached_first(db, ("product", ret.sku), db.query(Product).filter(Product.sku == ret.sku))
         if not prod:
             continue
 
-        inv = db.query(Inventory).filter(Inventory.sku == prod.sku).first()
+        inv = _cached_first(db, ("inventory", prod.sku), db.query(Inventory).filter(Inventory.sku == prod.sku))
         if not inv:
             continue
 
         daily_demand = inv.avg_daily_demand if inv.avg_daily_demand > 0 else 0.5
         coverage_days = int(inv.new_stock / daily_demand)
-        refurb_rule = db.query(RefurbishmentRule).filter(
-            RefurbishmentRule.category == prod.category
-        ).first()
+        refurb_rule = _cached_first(db, ("refurb", prod.category), db.query(RefurbishmentRule).filter(RefurbishmentRule.category == prod.category))
 
         if (
             coverage_days >= excess_stock_days_threshold
@@ -465,21 +464,17 @@ def get_batch_intelligence(
     batch_code: str
 ) -> Optional[BatchIntelligenceResponse]:
     """Build a batch report from actual return records and vendor terms."""
-    returns = db.query(Return).filter(
-        Return.supplier_batch == batch_code
-    ).all()
+    returns = _cached_all(db, ("batch_returns", batch_code), db.query(Return).filter(Return.supplier_batch == batch_code))
     if not returns:
         return None
 
     total_returns = sum(max(0, ret.quantity or 0) for ret in returns)
     sample_ret = returns[0]
-    prod = db.query(Product).filter(Product.sku == sample_ret.sku).first()
+    prod = _cached_first(db, ("product", sample_ret.sku), db.query(Product).filter(Product.sku == sample_ret.sku))
     if not prod:
         return None
 
-    supp = db.query(Supplier).filter(
-        Supplier.id == prod.supplier_id
-    ).first()
+    supp = _cached_first(db, ("supplier", prod.supplier_id), db.query(Supplier).filter(Supplier.id == prod.supplier_id))
     supplier_name = supp.supplier_name if supp else "Unknown"
 
     defects: Dict[str, int] = {}
@@ -531,4 +526,3 @@ def get_batch_intelligence(
         days_remaining_in_window=days_remaining,
         eligible_rtv_quantity=eligible_rtv
     )
-
