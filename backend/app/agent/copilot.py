@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Dict, Any, List, Optional
 from datetime import date
 from sqlalchemy.orm import Session
@@ -77,20 +78,56 @@ def tool_analyze_supplier_batch(db: Session, batch_code: str) -> Dict[str, Any]:
         return {"error": f"Batch '{batch_code}' not found in database."}
     return intel.model_dump()
 
+def get_vendor_term_for_product(db: Session, supplier_id: int, sku: str):
+    """Prefer SKU-specific terms, then fall back to supplier-wide terms."""
+    from app.models.models import VendorTerm
+
+    sku_term = (
+        db.query(VendorTerm)
+        .filter(VendorTerm.supplier_id == supplier_id, VendorTerm.sku == sku)
+        .first()
+    )
+    if sku_term:
+        return sku_term
+
+    return (
+        db.query(VendorTerm)
+        .filter(VendorTerm.supplier_id == supplier_id, VendorTerm.sku.is_(None))
+        .first()
+    )
+
+
 def tool_compare_recovery_routes(db: Session, return_id: int) -> Dict[str, Any]:
     ret = db.query(Return).filter(Return.id == return_id).first()
     if not ret:
         return {"error": f"Return #{return_id} not found."}
-    from app.models.models import Inventory, RefurbishmentRule, VendorTerm, LiquidationRule
+
+    from app.models.models import Inventory, RefurbishmentRule, LiquidationRule
+
     prod = db.query(Product).filter(Product.sku == ret.sku).first()
+    if not prod:
+        return {"error": f"Product for SKU '{ret.sku}' not found."}
+
     inv = db.query(Inventory).filter(Inventory.sku == prod.sku).first()
-    refurb = db.query(RefurbishmentRule).filter(RefurbishmentRule.category == prod.category).first()
-    vt = db.query(VendorTerm).filter(VendorTerm.supplier_id == prod.supplier_id).first()
-    liq = db.query(LiquidationRule).filter(LiquidationRule.category == prod.category, LiquidationRule.grade == ret.grade).first()
-    
-    vendor_qty = 24 if ret.supplier_batch == "HB-09" else None
-    analysis = calculate_route_options(prod, ret, inv, refurb, vt, liq, vendor_eligible_quantity=vendor_qty)
+    refurb = (
+        db.query(RefurbishmentRule)
+        .filter(RefurbishmentRule.category == prod.category)
+        .first()
+    )
+    vt = get_vendor_term_for_product(db, prod.supplier_id, prod.sku)
+    liq = (
+        db.query(LiquidationRule)
+        .filter(
+            LiquidationRule.category == prod.category,
+            LiquidationRule.grade == ret.grade,
+        )
+        .first()
+    )
+
+    # The calculator determines eligibility from actual vendor terms and dates.
+    analysis = calculate_route_options(prod, ret, inv, refurb, vt, liq)
     return analysis.model_dump()
+
 
 def tool_create_proposed_action(
     db: Session,
@@ -257,91 +294,173 @@ def run_copilot_deterministic_fallback(db: Session, message: str) -> CopilotChat
             suggested_actions=["Why is batch HB-09 flagged?", "Prepare a proposed action for these 40 headphones", "Which vendor-return windows are closing soon?"]
         )
         
-    # 2. "Why is batch HB-09 flagged?" / "batch HB-09"
-    elif any(k in msg_lower for k in ["hb-09", "batch hb", "concerning return pattern", "why is batch"]):
-        data = tool_analyze_supplier_batch(db, "HB-09")
-        tools_called.append({"tool": "analyze_supplier_batch", "args": {"batch_code": "HB-09"}, "result": "Batch HB-09 data retrieved"})
-        
+    # 2. Batch-specific supplier intelligence
+    elif any(k in msg_lower for k in ["batch", "concerning return pattern", "why is"]):
+        batch_match = re.search(r"\\b([A-Z0-9]+-[A-Z0-9-]+)\\b", message.upper())
+        batch_code = batch_match.group(1) if batch_match else None
+
+        if not batch_code:
+            first_return = db.query(Return).filter(Return.supplier_batch.isnot(None)).first()
+            batch_code = first_return.supplier_batch if first_return else None
+
+        if not batch_code:
+            return CopilotChatResponse(
+                response="I couldn't find a supplier batch in your message or the returns database.",
+                provider_used="Deterministic Recovery Copilot Engine (Rule-based Fallback)",
+                tools_called=[],
+                suggested_actions=["What needs my attention today?", "Which vendor-return windows are closing soon?"],
+            )
+
+        data = tool_analyze_supplier_batch(db, batch_code)
+        tools_called.append({
+            "tool": "analyze_supplier_batch",
+            "args": {"batch_code": batch_code},
+            "result": "Batch data retrieved",
+        })
+
         if "error" in data:
             return CopilotChatResponse(
                 response=f"Notice: {data['error']}",
                 provider_used="Deterministic Recovery Copilot Engine (Rule-based Fallback)",
-                tools_called=tools_called
+                tools_called=tools_called,
             )
-            
+
         resp_text = (
-            f"## Supplier Intelligence: Deep Dive on Batch HB-09\n\n"
-            f"**Issue**: Severe defect concentration detected in Batch `HB-09` from **{data['supplier_name']}** (SKU: `{data['sku']}`, {data['product_name']}).\n\n"
-            f"### Business Evidence:\n"
-            f"- **Total Returns**: {data['total_returns']} units received.\n"
-            f"- **Dominant Defect**: **{data['dominant_defect']}** accounts for **{data['dominant_defect_percentage']}%** of all batch returns.\n"
-            f"- **Observed Return Rate**: {data['observed_return_rate']}% vs. baseline expected return rate of {data['baseline_return_rate']}%.\n"
-            f"- **Vendor Return Status**: {data['eligible_rtv_quantity']} units remain eligible under the vendor agreement with {data['days_remaining_in_window']} days remaining.\n\n"
-            f"### Financial Impact:\n"
-            f"- Value at risk: ₹{data['total_returns'] * 1400:,.2f} at product cost price.\n"
-            f"- Eligible vendor credit: ₹{data['eligible_rtv_quantity'] * 1500:,.2f}.\n\n"
-            f"### Recommended Action:\n"
-            f"1. **Split-Batch Recovery**: Return 24 eligible units to the vendor for credit (₹36,000) and refurbish or liquidate the remaining 16 units.\n"
-            f"2. **Supplier Audit**: File a formal quality non-conformance notice with {data['supplier_name']} regarding batch HB-09 driver failure."
+            f"## Supplier Intelligence: Batch {batch_code}\\n\\n"
+            f"**Supplier:** {data.get('supplier_name', 'Not available')}\\n"
+            f"**Product:** {data.get('product_name', 'Not available')} "
+            f"(SKU: `{data.get('sku', 'Not available')}`)\\n\\n"
+            f"### Evidence from the database\\n"
+            f"- **Total returns:** {data.get('total_returns', 'Not available')} units.\\n"
+            f"- **Dominant defect:** {data.get('dominant_defect', 'Not identified')} "
+            f"({data.get('dominant_defect_percentage', 'Not available')}% of recorded batch returns).\\n"
+            f"- **Observed return rate:** {data.get('observed_return_rate', 'Not available')}%; "
+            f"baseline: {data.get('baseline_return_rate', 'Not available')}%.\\n"
+            f"- **Vendor-eligible quantity:** {data.get('eligible_rtv_quantity', 'Not available')} units; "
+            f"days remaining: {data.get('days_remaining_in_window', 'Not available')}.\\n\\n"
+            f"### Recommended next step\\n"
+            f"Review the batch evidence and vendor eligibility above before approving a recovery route. "
+            f"I have not estimated financial values that are not available in the database."
         )
         return CopilotChatResponse(
             response=resp_text,
             provider_used="Deterministic Recovery Copilot Engine (Rule-based Fallback)",
             tools_called=tools_called,
             evidence=data,
-            suggested_actions=["Prepare a proposed action for these 40 headphones", "What happens if we return 24 units and refurbish 16?", "Show me the financial difference between the best route and liquidation."]
+            suggested_actions=[
+                "What needs my attention today?",
+                "Which vendor-return windows are closing soon?",
+                "Show me the financial difference between the best route and liquidation.",
+            ],
         )
-        
-    # 3. Reference scenario: "Prepare a proposed action for these 40 headphones" / "split action" / "24 units and refurbish 16"
+
+    # 3. Prepare a data-driven proposed recovery action for an existing batch.
     elif any(k in msg_lower for k in ["40 headphones", "return 24", "split-batch", "split plan", "prepare a proposed action"]):
-        tools_called.append({"tool": "compare_recovery_routes", "args": {"batch": "HB-09"}, "result": "Calculated route economics"})
-        
-        # 40 headphones scenario math:
-        # 24 Vendor Return @ ₹1,500 = ₹36,000
-        # 16 Refurbish @ ₹1,625 = ₹26,000
-        # Total = ₹62,000 vs. Liquidation (40 @ ₹490 = ₹19,600) => +₹42,400 gain!
-        
-        # Check if action already exists or create pending
-        headphone_ret = db.query(Return).filter(Return.supplier_batch == "HB-09").first()
-        ret_id = [headphone_ret.id] if headphone_ret else [1]
-        
+        batch_match = re.search(r"\\b([A-Z0-9]+-[A-Z0-9-]+)\\b", message.upper())
+        batch_code = batch_match.group(1) if batch_match else None
+
+        if not batch_code:
+            demo_return = db.query(Return).filter(Return.supplier_batch == "HB-09").first()
+            if demo_return:
+                batch_code = demo_return.supplier_batch
+            else:
+                first_return = db.query(Return).filter(Return.status == "Pending Decision").first()
+                batch_code = first_return.supplier_batch if first_return else None
+
+        batch_returns = (
+            db.query(Return).filter(Return.supplier_batch == batch_code).all()
+            if batch_code else []
+        )
+        if not batch_returns:
+            return CopilotChatResponse(
+                response="I couldn't find returns for a batch to build a proposed action. Please specify an existing batch code.",
+                provider_used="Deterministic Recovery Copilot Engine (Rule-based Fallback)",
+                tools_called=tools_called,
+                suggested_actions=["What needs my attention today?", "Which vendor-return windows are closing soon?"],
+            )
+
+        total_quantity = sum(max(0, int(r.quantity or 0)) for r in batch_returns)
+        estimated_recovery = 0.0
+        analyzed_count = 0
+        route_summary = {}
+
+        for batch_return in batch_returns:
+            analysis_data = tool_compare_recovery_routes(db, batch_return.id)
+            if "error" in analysis_data:
+                continue
+
+            route = analysis_data.get("recommended_route")
+            net_value = 0.0
+            split_details = analysis_data.get("split_recommendation_details") or {}
+            routes = analysis_data.get("routes") or {}
+            if route == "Split-Batch":
+                net_value = float(split_details.get("total_split_net") or 0.0)
+            elif route in routes:
+                net_value = float((routes[route] or {}).get("net_recovery") or 0.0)
+
+            estimated_recovery += net_value
+            analyzed_count += 1
+            route_summary[route or "Unknown"] = (
+                route_summary.get(route or "Unknown", 0) + int(batch_return.quantity or 0)
+            )
+
+        if analyzed_count == 0:
+            return CopilotChatResponse(
+                response=f"I found batch `{batch_code}`, but couldn't calculate recovery for its returns. Please check the product and recovery-rule records.",
+                provider_used="Deterministic Recovery Copilot Engine (Rule-based Fallback)",
+                tools_called=tools_called,
+            )
+
+        first_return = batch_returns[0]
+        product = db.query(Product).filter(Product.sku == first_return.sku).first()
+        sku = product.sku if product else first_return.sku
+
         action_res = tool_create_proposed_action(
             db=db,
-            action_type="SPLIT_BATCH_RECOVERY",
-            sku="WH-1000XM-B",
-            batch="HB-09",
-            quantity=40,
-            estimated_recovery=62000.0,
-            explanation="Split-batch recovery: Dispatch 24 eligible units to SoundWave Dynamics for vendor credit (₹36,000 @ ₹1,500/unit) before the 30-day window expires. Refurbish remaining 16 units (₹26,000 net @ ₹1,625/unit). Outperforms full liquidation by +₹42,400.",
-            related_return_ids=ret_id
+            action_type="BATCH_RECOVERY_REVIEW",
+            sku=sku,
+            batch=batch_code or "",
+            quantity=total_quantity,
+            estimated_recovery=round(estimated_recovery, 2),
+            explanation=(
+                f"Proposed recovery review for batch {batch_code}, based on {analyzed_count} "
+                f"return records and deterministic route calculations. Route quantity summary: {route_summary}. "
+                "Review vendor eligibility, inventory demand, and route assumptions before approval."
+            ),
+            related_return_ids=[r.id for r in batch_returns],
         )
-        tools_called.append({"tool": "create_proposed_action", "result": f"Created Action #{action_res['action_id']}"})
-        
+        tools_called.append({
+            "tool": "create_proposed_action",
+            "result": f"Created Action #{action_res['action_id']}",
+        })
+
+        route_lines = "\\n".join(
+            f"- **{route}**: {quantity} units"
+            for route, quantity in sorted(route_summary.items())
+        ) or "- Route allocation unavailable"
+
         resp_text = (
-            f"## Split-Batch Recovery Plan Generated: Action #{action_res['action_id']}\n\n"
-            f"A formal simulated recovery action has been submitted to the **Action Approval Center** for your review.\n\n"
-            f"### Allocation Breakdown:\n"
-            f"| Route | Quantity | Unit Net | Subtotal Net | Time-to-Cash | Notes |\n"
-            f"|---|---|---|---|---|---|\n"
-            f"| **Vendor Return (RTV)** | 24 units | ₹1,500.00 | **₹36,000.00** | 14 days | Captures 60% MSRP vendor credit before window closes; bypasses demand risk |\n"
-            f"| **Refurbish** | 16 units | ₹1,625.00 | **₹26,000.00** | 15 days | Resale @ 75% MSRP (₹1,875) minus ₹250 repair cost |\n"
-            f"| **Total Recovery** | **40 units** | - | **₹62,000.00** | **14.4 days** | **+₹42,400.00 vs full liquidation** |\n\n"
-            f"### Baseline Comparison:\n"
-            f"- If liquidated at 35% of cost (₹490/unit): **₹19,600.00**\n"
-            f"- **Net Value Created by Split Plan**: **+₹42,400.00 (+216% higher recovery)**\n\n"
-            f"### Important Assumptions & Demand Context:\n"
-            f"- 24 units are within the active vendor return agreement with SoundWave Dynamics.\n"
-            f"- Warehouse has 60 days of new stock coverage; allocating only 16 units to refurbishment avoids swamping existing inventory.\n\n"
-            f"**Status**: Pending approval in the **Action Approval Center**."
+            f"## Proposed Batch Recovery Review: Action #{action_res['action_id']}\\n\\n"
+            f"A proposal has been submitted to the **Action Approval Center** for human review.\\n\\n"
+            f"- **Batch:** `{batch_code}`\\n"
+            f"- **Returns analyzed:** {analyzed_count}\\n"
+            f"- **Units represented:** {total_quantity}\\n"
+            f"- **Estimated recovery from current route recommendations:** ₹{estimated_recovery:,.2f}\\n\\n"
+            f"### Current recommended routes\\n{route_lines}\\n\\n"
+            f"**Status:** Pending human approval. This is a recovery review, not a pre-approved split plan."
         )
         return CopilotChatResponse(
             response=resp_text,
             provider_used="Deterministic Recovery Copilot Engine (Rule-based Fallback)",
             tools_called=tools_called,
             evidence=action_res,
-            suggested_actions=["What needs my attention today?", "Which vendor-return windows are closing soon?", "Show me the financial difference between the best route and liquidation."]
+            suggested_actions=[
+                "What needs my attention today?",
+                "Which vendor-return windows are closing soon?",
+                "Show me the financial difference between the best route and liquidation.",
+            ],
         )
-        
+
     # 4. "Which vendor-return windows are closing soon?"
     elif any(k in msg_lower for k in ["vendor", "window", "closing", "deadline", "rtv"]):
         data = tool_get_expiring_vendor_windows(db, 7)
@@ -399,7 +518,7 @@ def run_copilot_deterministic_fallback(db: Session, message: str) -> CopilotChat
             
         resp_text = (
             f"## Items Headed for Liquidation That Could Earn Significantly More\n\n"
-            f"Default liquidation converts inventory at only ~35% of cost. Here are returns where liquidation would destroy substantial recovery value:\n\n"
+            f"Here are returns where the deterministic recovery engine estimates a higher-value alternative to liquidation:\n\n"
             f"{items_md}\n"
             f"**Business Takeaway**: Rerouting these items to Vendor Return or Refurbishment protects company gross margins."
         )
