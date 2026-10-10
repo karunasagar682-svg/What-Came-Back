@@ -136,13 +136,16 @@ def calculate_route_options(
     days_remaining = max(0, window_days - days_waiting)
     
     # If explicit vendor eligible qty passed (like 24 out of 40), use it, else check window
-    effective_vendor_qty = vendor_eligible_quantity if vendor_eligible_quantity is not None else (qty if days_waiting <= window_days else 0)
-    is_vendor_eligible = has_rtv and (effective_vendor_qty > 0) and (days_remaining > 0 or effective_vendor_qty > 0)
+    # An explicit quota cannot override an expired vendor window.
+    window_open = days_waiting <= window_days
+    requested_vendor_qty = qty if vendor_eligible_quantity is None else max(0, min(qty, vendor_eligible_quantity))
+    effective_vendor_qty = requested_vendor_qty if has_rtv and window_open else 0
+    is_vendor_eligible = effective_vendor_qty > 0
     
     vendor_ineligible_reason = None
     if not has_rtv:
         vendor_ineligible_reason = "Supplier agreement does not permit Return-to-Vendor (RTV)."
-    elif days_waiting > window_days and effective_vendor_qty == 0:
+    elif not window_open:
         vendor_ineligible_reason = f"Vendor return window expired ({days_waiting} days elapsed vs {window_days}-day limit)."
     elif effective_vendor_qty == 0:
         vendor_ineligible_reason = "No units eligible under current vendor return quota or policy."
@@ -251,14 +254,21 @@ def calculate_route_options(
     is_split_recommended = False
     split_details = None
     
-    if effective_vendor_qty > 0 and effective_vendor_qty < qty:
+    if is_vendor_eligible and 0 < effective_vendor_qty < qty:
         remaining_qty = qty - effective_vendor_qty
         # Compare remaining qty options
         rem_refurb_net = (refurb_detail.recovery_per_unit * remaining_qty) if is_refurb_eligible else 0.0
         rem_liq_net = (liq_detail.recovery_per_unit * remaining_qty)
         
-        best_remaining_route = "Refurbish" if (is_refurb_eligible and rem_refurb_net > rem_liq_net) else "Liquidation"
-        total_split_net = vendor_detail.net_recovery + (rem_refurb_net if best_remaining_route == "Refurbish" else rem_liq_net)
+        rem_restock_net = restock_detail.recovery_per_unit * remaining_qty if is_restock_eligible else 0.0
+        remaining_options = {"Liquidation": rem_liq_net}
+        if is_refurb_eligible:
+            remaining_options["Refurbish"] = rem_refurb_net
+        if is_restock_eligible:
+            remaining_options["Restock"] = rem_restock_net
+        best_remaining_route = max(remaining_options, key=remaining_options.get)
+        remaining_net = remaining_options[best_remaining_route]
+        total_split_net = vendor_detail.net_recovery + remaining_net
         all_liq_net = liq_detail.net_recovery
         
         is_split_recommended = True
@@ -267,20 +277,25 @@ def calculate_route_options(
             "vendor_net": vendor_detail.net_recovery,
             "remaining_quantity": remaining_qty,
             "remaining_route": best_remaining_route,
-            "remaining_net": rem_refurb_net if best_remaining_route == "Refurbish" else rem_liq_net,
+            "remaining_net": remaining_net,
             "total_split_net": round(total_split_net, 2),
             "incremental_gain_over_liquidation": round(total_split_net - all_liq_net, 2),
-            "notes": f"Return {effective_vendor_qty} units to vendor for guaranteed credit (₹{vendor_detail.recovery_per_unit}/unit). {best_remaining_route} the remaining {remaining_qty} units (₹{refurb_detail.recovery_per_unit if best_remaining_route == 'Refurbish' else liq_detail.recovery_per_unit}/unit)."
+            "notes": f"Return {effective_vendor_qty} units to vendor for guaranteed credit (₹{vendor_detail.recovery_per_unit}/unit). {best_remaining_route} the remaining {remaining_qty} units (₹{routes[best_remaining_route].recovery_per_unit}/unit)."
         }
+        # Recommend a split only if it improves on the best eligible full-batch route.
+        full_batch_options = [r for r in routes.values() if r.is_eligible and r.route != "Scrap"]
+        best_full_batch_net = max((r.net_recovery for r in full_batch_options), default=0.0)
+        is_split_recommended = total_split_net > best_full_batch_net
         recommended_route = "Split-Batch"
         rec_reason = (
             f"Split-batch strategy maximizes total recovery at ₹{round(total_split_net, 2):,}: "
             f"Return {effective_vendor_qty} eligible units to vendor for ₹{round(vendor_detail.net_recovery, 2):,} credit "
-            f"(eliminating inventory & demand risk), and {best_remaining_route.lower()} the remaining {remaining_qty} units for ₹{round(rem_refurb_net if best_remaining_route == 'Refurbish' else rem_liq_net, 2):,} net recovery."
+            f"(eliminating inventory & demand risk), and {best_remaining_route.lower()} the remaining {remaining_qty} units for ₹{round(remaining_net, 2):,} net recovery."
         )
         best_alt_route = "Liquidation"
         incremental_over_liq = round(total_split_net - liq_net, 2)
-    else:
+    if not is_split_recommended:
+        split_details = None
         # Standard single route ranking
         eligible_routes = [r for r in routes.values() if r.is_eligible and r.route != "Scrap"]
         if not eligible_routes:
@@ -372,7 +387,12 @@ def evaluate_split_plan(
     all_liq_recovery = round(unit_liq_recovery * total_qty, 2)
     
     # Check max vendor limit
-    vendor_limit = max_vendor_eligible_qty if max_vendor_eligible_qty is not None else total_qty
+    if current_date is None:
+        current_date = date.today()
+    return_date = return_item.return_date if isinstance(return_item.return_date, date) else return_item.return_date.date()
+    days_waiting = max(0, (current_date - return_date).days)
+    vendor_window_open = bool(vendor_term and days_waiting <= vendor_term.window_days)
+    vendor_limit = min(total_qty, max(0, max_vendor_eligible_qty)) if max_vendor_eligible_qty is not None else total_qty
     
     # Check each allocated route
     for item in allocations:
@@ -419,6 +439,10 @@ def evaluate_split_plan(
                 is_eligible = False
                 eligibility_note = "Supplier does not accept Return-to-Vendor."
                 validation_errors.append(eligibility_note)
+            elif not vendor_window_open:
+                is_eligible = False
+                eligibility_note = "Vendor return window has expired."
+                validation_errors.append(eligibility_note)
             elif alloc_qty > vendor_limit:
                 is_eligible = False
                 eligibility_note = f"Allocated quantity ({alloc_qty}) exceeds eligible vendor quota ({vendor_limit})."
@@ -456,7 +480,7 @@ def evaluate_split_plan(
             f"Total allocated quantity ({total_allocated}) exceeds total batch quantity ({total_qty})."
         )
         
-    is_valid = (len(validation_errors) == 0) and (total_allocated > 0)
+    is_valid = (len(validation_errors) == 0) and (total_allocated == total_qty)
     
     weighted_avg_time = round(weighted_time_days / total_allocated, 1) if total_allocated > 0 else 0.0
     incremental_gain = round(total_net_recovery - all_liq_recovery, 2)
