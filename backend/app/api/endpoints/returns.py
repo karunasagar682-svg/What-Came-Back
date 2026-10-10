@@ -105,13 +105,28 @@ def get_recovery_context(db, product, return_item, supplier):
         .first()
     )
 
-    vendor_term = (
-        db.query(VendorTerm)
-        .filter(VendorTerm.supplier_id == supplier.id)
-        .first()
-        if supplier
-        else None
-    )
+    # Prefer a rule specific to this SKU. If none exists, use the
+    # supplier-wide rule (where sku is NULL), if one is configured.
+    vendor_term = None
+    if supplier:
+        vendor_term = (
+            db.query(VendorTerm)
+            .filter(
+                VendorTerm.supplier_id == supplier.id,
+                VendorTerm.sku == product.sku,
+            )
+            .first()
+        )
+
+        if not vendor_term:
+            vendor_term = (
+                db.query(VendorTerm)
+                .filter(
+                    VendorTerm.supplier_id == supplier.id,
+                    VendorTerm.sku.is_(None),
+                )
+                .first()
+            )
 
     liquidation_rule = (
         db.query(LiquidationRule)
@@ -122,10 +137,8 @@ def get_recovery_context(db, product, return_item, supplier):
         .first()
     )
 
-    vendor_quantity = (
-        24 if return_item.supplier_batch == "HB-09" else None
-    )
-
+    # Do not hardcode batch-specific eligibility here. The calculator
+    # should determine eligibility from the vendor terms and return date.
     analysis = calculate_route_options(
         product,
         return_item,
@@ -133,7 +146,6 @@ def get_recovery_context(db, product, return_item, supplier):
         refurbishment_rule,
         vendor_term,
         liquidation_rule,
-        vendor_eligible_quantity=vendor_quantity,
     )
 
     return analysis
