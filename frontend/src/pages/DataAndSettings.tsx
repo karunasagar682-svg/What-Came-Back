@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Upload,
   Download,
@@ -28,6 +28,7 @@ export const DataAndSettings: React.FC = () => {
   const [uploadResult, setUploadResult] = useState<any | null>(null);
   const [uploading, setUploading] = useState<boolean>(false);
   const [toast, setToast] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     loadInitialData();
@@ -62,6 +63,12 @@ export const DataAndSettings: React.FC = () => {
   };
 
   const handleSeedDemo = async () => {
+    // Demo seeding may reset existing database data. Require explicit confirmation.
+    const confirmed = window.confirm(
+      'Load the demo scenario? This may replace/reset existing project data. Export or back up important data before continuing.'
+    );
+    if (!confirmed) return;
+
     setSeedingDemo(true);
     try {
       await api.seedDemoScenario();
@@ -85,6 +92,9 @@ export const DataAndSettings: React.FC = () => {
       setUploadResult(res);
       setToast(`Import complete: ${res.successful_rows} succeeded, ${res.failed_rows} failed.`);
       setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
     } catch (err: any) {
       alert(`Upload error: ${err.message}`);
     } finally {
@@ -100,7 +110,10 @@ export const DataAndSettings: React.FC = () => {
     const a = document.createElement('a');
     a.href = url;
     a.download = `sample_${entity}_template.csv`;
+    document.body.appendChild(a);
     a.click();
+    a.remove();
+    window.setTimeout(() => window.URL.revokeObjectURL(url), 1000);
   };
 
   if (loading || !settings) {
@@ -182,12 +195,17 @@ export const DataAndSettings: React.FC = () => {
                 <option value="products">Products</option>
                 <option value="suppliers">Suppliers</option>
                 <option value="inventory">Inventory</option>
+                <option value="vendor_terms">Vendor Terms</option>
+                <option value="refurbishment">Refurbishment Rules</option>
+                <option value="liquidation">Liquidation Rules</option>
+                <option value="sales">Sales History</option>
               </select>
             </div>
 
             <div className="md:col-span-2">
               <label className="block text-xs font-bold text-slate-700 mb-1">CSV File:</label>
               <input
+                ref={fileInputRef}
                 type="file"
                 accept=".csv"
                 onChange={(e) => setSelectedFile(e.target.files ? e.target.files[0] : null)}
