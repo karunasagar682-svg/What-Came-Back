@@ -12,25 +12,39 @@ import {
   SystemSettings
 } from '../types';
 
-const API_BASE = '/api';
+// Production: use the Render backend.
+// Development: use Vite's proxy to the local backend.
+const API_BASE = import.meta.env.PROD
+  ? `${(import.meta.env.VITE_API_BASE_URL || 'https://what-came-back.onrender.com').replace(/\/+$/, '')}/api`
+  : '/api';
+
+async function parseError(res: Response, fallback: string): Promise<Error> {
+  try {
+    const data = await res.json();
+    return new Error(data.detail || fallback);
+  } catch {
+    return new Error(`${fallback} (HTTP ${res.status})`);
+  }
+}
 
 export const api = {
   // Health
   async getHealth() {
     const res = await fetch(`${API_BASE}/health`);
+    if (!res.ok) throw await parseError(res, 'Failed to check backend health');
     return res.json();
   },
 
   // Dashboard
   async getDashboardSummary(): Promise<DashboardSummary> {
     const res = await fetch(`${API_BASE}/dashboard/summary`);
-    if (!res.ok) throw new Error('Failed to fetch dashboard summary');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch dashboard summary');
     return res.json();
   },
 
   async getDashboardPriorities(): Promise<PriorityItem[]> {
     const res = await fetch(`${API_BASE}/dashboard/priorities`);
-    if (!res.ok) throw new Error('Failed to fetch priorities');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch priorities');
     return res.json();
   },
 
@@ -38,13 +52,13 @@ export const api = {
   async getReturns(params?: Record<string, string>): Promise<ReturnItem[]> {
     const query = new URLSearchParams(params || {}).toString();
     const res = await fetch(`${API_BASE}/returns${query ? `?${query}` : ''}`);
-    if (!res.ok) throw new Error('Failed to fetch returns');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch returns');
     return res.json();
   },
 
   async getReturnDetail(id: number): Promise<{ return: any; recovery_analysis: RouteComparisonResult }> {
     const res = await fetch(`${API_BASE}/returns/${id}`);
-    if (!res.ok) throw new Error('Failed to fetch return details');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch return details');
     return res.json();
   },
 
@@ -68,10 +82,11 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || 'Failed to create return record');
+      throw await parseError(res, 'Failed to create return record');
     }
+
     return res.json();
   },
 
@@ -81,10 +96,11 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || 'Failed to update return record');
+      throw await parseError(res, 'Failed to update return record');
     }
+
     return res.json();
   },
 
@@ -95,7 +111,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ return_id: returnId })
     });
-    if (!res.ok) throw new Error('Failed to analyze recovery');
+
+    if (!res.ok) throw await parseError(res, 'Failed to analyze recovery');
     return res.json();
   },
 
@@ -110,20 +127,24 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error('Failed to evaluate split batch allocation');
+
+    if (!res.ok) {
+      throw await parseError(res, 'Failed to evaluate split batch allocation');
+    }
+
     return res.json();
   },
 
   // Suppliers
   async getSupplierAlerts(): Promise<SupplierAlert[]> {
     const res = await fetch(`${API_BASE}/suppliers/alerts`);
-    if (!res.ok) throw new Error('Failed to fetch supplier alerts');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch supplier alerts');
     return res.json();
   },
 
   async getBatchIntelligence(batchId: string): Promise<BatchIntelligence> {
-    const res = await fetch(`${API_BASE}/suppliers/batches/${batchId}`);
-    if (!res.ok) throw new Error('Failed to fetch batch intelligence');
+    const res = await fetch(`${API_BASE}/suppliers/batches/${encodeURIComponent(batchId)}`);
+    if (!res.ok) throw await parseError(res, 'Failed to fetch batch intelligence');
     return res.json();
   },
 
@@ -131,7 +152,7 @@ export const api = {
   async getActions(status?: string): Promise<ProposedAction[]> {
     const query = status ? `?status=${encodeURIComponent(status)}` : '';
     const res = await fetch(`${API_BASE}/actions${query}`);
-    if (!res.ok) throw new Error('Failed to fetch proposed actions');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch proposed actions');
     return res.json();
   },
 
@@ -149,7 +170,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error('Failed to create proposed action');
+
+    if (!res.ok) throw await parseError(res, 'Failed to create proposed action');
     return res.json();
   },
 
@@ -159,10 +181,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ actor, reason })
     });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || 'Failed to approve action');
-    }
+
+    if (!res.ok) throw await parseError(res, 'Failed to approve action');
     return res.json();
   },
 
@@ -172,34 +192,36 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ actor, reason })
     });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || 'Failed to reject action');
-    }
+
+    if (!res.ok) throw await parseError(res, 'Failed to reject action');
     return res.json();
   },
 
   async getActivityLogs(): Promise<ActivityLogItem[]> {
     const res = await fetch(`${API_BASE}/actions/logs`);
-    if (!res.ok) throw new Error('Failed to fetch activity logs');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch activity logs');
     return res.json();
   },
 
   // Copilot Chat
-  async chatWithCopilot(message: string, history: Array<{ role: string; content: string }> = []): Promise<CopilotChatResponse> {
+  async chatWithCopilot(
+    message: string,
+    history: Array<{ role: string; content: string }> = []
+  ): Promise<CopilotChatResponse> {
     const res = await fetch(`${API_BASE}/copilot/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, history })
     });
-    if (!res.ok) throw new Error('Copilot service error');
+
+    if (!res.ok) throw await parseError(res, 'Copilot service error');
     return res.json();
   },
 
   // Settings & Data
   async getSettings(): Promise<SystemSettings> {
     const res = await fetch(`${API_BASE}/settings`);
-    if (!res.ok) throw new Error('Failed to fetch settings');
+    if (!res.ok) throw await parseError(res, 'Failed to fetch settings');
     return res.json();
   },
 
@@ -209,19 +231,23 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(settings)
     });
-    if (!res.ok) throw new Error('Failed to update settings');
+
+    if (!res.ok) throw await parseError(res, 'Failed to update settings');
     return res.json();
   },
 
   async getTemplates(): Promise<Record<string, string>> {
     const res = await fetch(`${API_BASE}/data/templates`);
-    if (!res.ok) throw new Error('Failed to load templates');
+    if (!res.ok) throw await parseError(res, 'Failed to load templates');
     return res.json();
   },
 
   async seedDemoScenario(): Promise<any> {
-    const res = await fetch(`${API_BASE}/data/seed-demo`, { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to load demo scenario');
+    const res = await fetch(`${API_BASE}/data/seed-demo`, {
+      method: 'POST'
+    });
+
+    if (!res.ok) throw await parseError(res, 'Failed to load demo scenario');
     return res.json();
   },
 
@@ -234,10 +260,8 @@ export const api = {
       method: 'POST',
       body: formData
     });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || 'CSV upload failed');
-    }
+
+    if (!res.ok) throw await parseError(res, 'CSV upload failed');
     return res.json();
   }
 };
