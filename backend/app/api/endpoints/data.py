@@ -248,20 +248,26 @@ async def import_csv_dataset(
 
     # RETURNS
     elif entity_type == "returns":
-        # Accept both the application's template and the organizer's dataset.
+        # Keep the format check simple and support both CSV formats.
         organizer_format = (
-            ("date_received" in headers or "return_date" not in headers)
-            and ("condition_grade" in headers or "grade" not in headers)
-            and "sku" in headers
-            and "supplier_batch" in headers
-            and "reason_code" in headers
+            "date_received" in headers
+            and "condition_grade" in headers
         )
 
-        required = (
-            {"date_received" if "date_received" in headers else "return_date",
-             "sku", "supplier_batch", "reason_code",
-             "condition_grade" if "condition_grade" in headers else "grade"}
-        )
+        # Pick the date and grade column names used by this CSV.
+        date_column = "date_received" if "date_received" in headers else "return_date"
+        grade_column = "condition_grade" if "condition_grade" in headers else "grade"
+
+        # These columns are always required.
+        required = {
+            date_column,
+            "sku",
+            "supplier_batch",
+            "reason_code",
+            grade_column,
+        }
+
+        # The organizer's CSV has no quantity column; other formats must include it.
         if not organizer_format:
             required.add("quantity")
 
@@ -296,10 +302,9 @@ async def import_csv_dataset(
                             "Import products first."
                         )
 
-                    date_value = row.get("date_received") or row.get("return_date")
-                    r_date = parse_date(date_value)
+                    r_date = parse_date(row.get(date_column, ""))
 
-                    grade_value = row.get("condition_grade") or row.get("grade") or ""
+                    grade_value = row.get(grade_column, "")
                     grade = grade_value.strip().upper()
                     if grade not in {"A", "B", "C", "D"}:
                         raise ValueError(f"Invalid grade '{grade}'.")
