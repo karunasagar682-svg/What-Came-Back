@@ -16,6 +16,34 @@ import {
 import { api } from '../services/api';
 import { ReturnItem, RouteComparisonResult } from '../types';
 
+const getDispositionStatusClasses = (status: string): string => {
+  const normalizedStatus = (status || '').toLowerCase();
+
+  if (normalizedStatus.includes('approved') || normalizedStatus === 'completed' || normalizedStatus === 'processed') {
+    return 'bg-emerald-50 text-emerald-800 border-emerald-300';
+  }
+  if (normalizedStatus.includes('rejected') || normalizedStatus.includes('cancelled')) {
+    return 'bg-red-50 text-red-800 border-red-300';
+  }
+  if (normalizedStatus.includes('process')) {
+    return 'bg-blue-50 text-blue-800 border-blue-300';
+  }
+  if (normalizedStatus.includes('pending') || normalizedStatus.includes('decision')) {
+    return 'bg-amber-50 text-amber-800 border-amber-300';
+  }
+  return 'bg-slate-50 text-slate-700 border-slate-300';
+};
+
+const DispositionStatusBadge: React.FC<{ status: string }> = ({ status }) => (
+  <span
+    className={`inline-flex items-center rounded-lg border px-2.5 py-1 text-[11px] font-bold ${getDispositionStatusClasses(status)}`}
+    title={`Current disposition status: ${status || 'Unknown'}`}
+  >
+    <span className="mr-1.5 h-1.5 w-1.5 rounded-full bg-current" />
+    {status || 'Unknown'}
+  </span>
+);
+
 export const ReturnsWorkbench: React.FC = () => {
   const navigate = useNavigate();
   const [returns, setReturns] = useState<ReturnItem[]>([]);
@@ -84,19 +112,6 @@ export const ReturnsWorkbench: React.FC = () => {
     loadReturns();
   };
 
-  const handleInlineStatusChange = async (id: number, newStatus: string) => {
-    try {
-      await api.updateReturn(id, { status: newStatus });
-      setToastMessage(`Return #${id} status updated to '${newStatus}'!`);
-      // Update local state immediately
-      setReturns((prev) =>
-        prev.map((r) => (r.id === id ? { ...r, status: newStatus } : r))
-      );
-      setTimeout(() => setToastMessage(null), 3000);
-    } catch (err: any) {
-      alert(`Error updating return status: ${err.message}`);
-    }
-  };
 
   const openReturnDetail = async (item: ReturnItem) => {
     setSelectedReturn(item);
@@ -340,27 +355,9 @@ export const ReturnsWorkbench: React.FC = () => {
                       ₹{item.estimated_net_recovery?.toLocaleString('en-IN') || 0}
                     </td>
 
-                    {/* DISPOSITION STATUS COLUMN (Interactive inline update) */}
+                    {/* DISPOSITION STATUS: dynamically reflects the current backend status */}
                     <td className="py-3 px-4" onClick={(e) => e.stopPropagation()}>
-                      <select
-                        value={item.status}
-                        onChange={(e) => handleInlineStatusChange(item.id, e.target.value)}
-                        className={`text-[11px] font-bold px-2 py-1 rounded-lg border focus:ring-2 focus:ring-teal-500 cursor-pointer ${
-                          item.status === 'Action Approved' || item.status.includes('Approved')
-                            ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                            : item.status === 'In Process'
-                            ? 'bg-blue-50 text-blue-800 border-blue-300'
-                            : item.status === 'Action Rejected'
-                            ? 'bg-red-50 text-red-800 border-red-300'
-                            : 'bg-amber-50 text-amber-800 border-amber-300'
-                        }`}
-                      >
-                        <option value="Pending Decision">Pending Decision</option>
-                        <option value="In Process">In Process</option>
-                        <option value="Action Approved">Action Approved</option>
-                        <option value="Action Rejected">Action Rejected</option>
-                        <option value="Completed">Completed</option>
-                      </select>
+                      <DispositionStatusBadge status={item.status} />
                     </td>
 
                     {/* ACTION APPROVAL TASK COLUMN (Reflects Action Approval Center tasks) */}
@@ -459,27 +456,13 @@ export const ReturnsWorkbench: React.FC = () => {
               </div>
             </div>
 
-            {/* Current Status Selector in Drawer */}
-            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between">
+            {/* Dynamic current status; status changes remain managed by the existing action workflow */}
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between gap-3">
               <div>
-                <span className="text-xs font-bold text-slate-800 block">Disposition Status:</span>
-                <span className="text-[11px] text-slate-500">Update status directly in the recovery ledger</span>
+                <span className="text-xs font-bold text-slate-800 block">Disposition Status</span>
+                <span className="text-[11px] text-slate-500">Current status from the returns record</span>
               </div>
-              <select
-                value={selectedReturn.status}
-                onChange={async (e) => {
-                  const newStatus = e.target.value;
-                  await handleInlineStatusChange(selectedReturn.id, newStatus);
-                  setSelectedReturn({ ...selectedReturn, status: newStatus });
-                }}
-                className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-bold bg-white text-slate-800"
-              >
-                <option value="Pending Decision">Pending Decision</option>
-                <option value="In Process">In Process</option>
-                <option value="Action Approved">Action Approved</option>
-                <option value="Action Rejected">Action Rejected</option>
-                <option value="Completed">Completed</option>
-              </select>
+              <DispositionStatusBadge status={selectedReturn.status} />
             </div>
 
             {/* Route Analysis Comparison */}
